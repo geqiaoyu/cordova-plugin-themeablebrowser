@@ -18,6 +18,11 @@
  */
 
 #import "CDVThemeableBrowser.h"
+
+#if __has_include("CDVWKProcessPoolFactory.h")
+#import "CDVWKProcessPoolFactory.h"
+#endif
+
 #import <Cordova/CDVPluginResult.h>
 #import <Cordova/CDVUserAgentUtil.h>
 
@@ -42,9 +47,11 @@
 #define    kThemeableBrowserPropWwwImageDensity @"wwwImageDensity"
 #define    kThemeableBrowserPropStaticText @"staticText"
 #define    kThemeableBrowserPropShowProgress @"showProgress"
-#define    kThemeableBrowserPropShowPageTitle @"showPageTitle"
 #define    kThemeableBrowserPropProgressBgColor @"progressBgColor"
 #define    kThemeableBrowserPropProgressColor @"progressColor"
+#define    kThemeableBrowserPropShowPageTitle @"showPageTitle"
+#define    kThemeableBrowserPropSize @"size"
+#define    kThemeableBrowserPropShowFirstTime @"showFirstTime"
 #define    kThemeableBrowserPropAlign @"align"
 #define    kThemeableBrowserPropTitle @"title"
 #define    kThemeableBrowserPropCancel @"cancel"
@@ -57,15 +64,12 @@
 #define    kThemeableBrowserEmitCodeUnexpected @"unexpected"
 #define    kThemeableBrowserEmitCodeUndefined @"undefined"
 
+#define    IAB_BRIDGE_NAME @"cordova_iab"
+
 #define    TOOLBAR_DEF_HEIGHT 44.0
 #define    LOCATIONBAR_HEIGHT 21.0
 #define    FOOTER_HEIGHT ((TOOLBAR_HEIGHT) + (LOCATIONBAR_HEIGHT))
-
-NSString *completeRPCURLPath = @"/webviewprogressproxy/complete";
-
-const float MyInitialProgressValue = 0.1f;
-const float MyInteractiveProgressValue = 0.5f;
-const float MyFinalProgressValue = 0.9f;
+#define    TAG_SALT 100
 
 #pragma mark CDVThemeableBrowser
 
@@ -75,6 +79,8 @@ const float MyFinalProgressValue = 0.9f;
     NSURL *initUrl;  // initial URL ThemeableBrowser opened with
     NSURL *originalUrl;
 }
+@property (nonatomic,strong) dispatch_source_t timer;
+
 @end
 
 @implementation CDVThemeableBrowser
@@ -87,7 +93,7 @@ const float MyFinalProgressValue = 0.9f;
     _callbackIdPattern = nil;
 }
 #else
-- (CDVThemeableBrowser*)initWithWebView:(UIWebView*)theWebView
+- (CDVThemeableBrowser*)initWithWebView:(WKWebView*)theWebView
 {
     self = [super initWithWebView:theWebView];
     if (self != nil) {
@@ -99,6 +105,11 @@ const float MyFinalProgressValue = 0.9f;
     return self;
 }
 #endif
+
+- (id)settingForKey:(NSString*)key
+{
+    return [self.commandDelegate.settings objectForKey:[key lowercaseString]];
+}
 
 - (void)onReset
 {
@@ -112,6 +123,8 @@ const float MyFinalProgressValue = 0.9f;
               withMessage:@"Close called but already closed."];
         return;
     }
+
+    dispatch_source_cancel(_timer);
     // Things are cleaned up in browserExit.
     [self.themeableBrowserViewController close];
 }
@@ -170,6 +183,19 @@ const float MyFinalProgressValue = 0.9f;
 
     [pluginResult setKeepCallback:[NSNumber numberWithBool:YES]];
     [self.commandDelegate sendPluginResult:pluginResult callbackId:command.callbackId];
+    NSTimeInterval delayTime=3.0f;
+    NSTimeInterval timeInterval=1.0f;
+    dispatch_queue_t queue = dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0);
+    _timer = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0, queue);
+    dispatch_time_t startDelayTime = dispatch_time(DISPATCH_TIME_NOW, (int64_t)(delayTime * NSEC_PER_SEC));
+    dispatch_source_set_timer(_timer, startDelayTime, timeInterval * NSEC_PER_SEC, 0.1 * NSEC_PER_SEC);
+    dispatch_source_set_event_handler(_timer, ^{
+        CDVPluginResult* pluginResult;
+        pluginResult = [CDVPluginResult resultWithStatus:CDVCommandStatus_OK];
+        [pluginResult setKeepCallback:[NSNumber numberWithBool:YES]];
+        [self.commandDelegate sendPluginResult:pluginResult callbackId:command.callbackId];
+    });
+    dispatch_resume(_timer);
 }
 
 - (void)reload:(CDVInvokedUrlCommand*)command
@@ -179,6 +205,14 @@ const float MyFinalProgressValue = 0.9f;
     }
 }
 
+- (void)changeButtonImage:(CDVInvokedUrlCommand *)command {
+    if (self.themeableBrowserViewController) {
+        NSInteger buttonIndex = [[command.arguments objectAtIndex:0] integerValue];
+        NSDictionary* buttonProps = [command.arguments objectAtIndex:1];;
+        [self.themeableBrowserViewController changeButtonImage:buttonIndex buttonProps:buttonProps];
+    }
+}
+    
 - (CDVThemeableBrowserOptions*)parseOptions:(NSString*)options
 {
     CDVThemeableBrowserOptions* obj = [[CDVThemeableBrowserOptions alloc] init];
@@ -246,13 +280,24 @@ const float MyFinalProgressValue = 0.9f;
     }
 
     if (self.themeableBrowserViewController == nil) {
-        NSString* originalUA = [CDVUserAgentUtil originalUserAgent];
+        NSString* userAgent = [CDVUserAgentUtil originalUserAgent];
+        NSString* overrideUserAgent = [self settingForKey:@"OverrideUserAgent"];
+        if (browserOptions.customUserAgent) {
+            userAgent = browserOptions.customUserAgent;
+        } else if (overrideUserAgent) {
+            userAgent = overrideUserAgent;
+        } else {
+            NSString* appendUserAgent = [self settingForKey:@"AppendUserAgent"];
+            if(appendUserAgent) {
+                userAgent = [userAgent stringByAppendingString: appendUserAgent];
+            }
+        }
         self.themeableBrowserViewController = [[CDVThemeableBrowserViewController alloc]
-                                               initWithUserAgent:originalUA prevUserAgent:[self.commandDelegate userAgent]
+                                               initWithUserAgent:userAgent prevUserAgent:[self.commandDelegate userAgent]
                                                browserOptions: browserOptions
                                                navigationDelete:self
                                                statusBarStyle:[UIApplication sharedApplication].statusBarStyle];
-
+        
         if ([self.viewController conformsToProtocol:@protocol(CDVScreenOrientationDelegate)]) {
             self.themeableBrowserViewController.orientationDelegate = (UIViewController <CDVScreenOrientationDelegate>*)self.viewController;
         }
@@ -297,16 +342,20 @@ const float MyFinalProgressValue = 0.9f;
             }
         }
     }
+    
+    // Todo: options need to be updated based on WKWebView which are not directly translatable from UIWebView
 
     // UIWebView options
-    self.themeableBrowserViewController.webView.scalesPageToFit = browserOptions.zoom;
-    self.themeableBrowserViewController.webView.mediaPlaybackRequiresUserAction = browserOptions.mediaplaybackrequiresuseraction;
-    self.themeableBrowserViewController.webView.allowsInlineMediaPlayback = browserOptions.allowinlinemediaplayback;
-    if (IsAtLeastiOSVersion(@"6.0")) {
-        self.themeableBrowserViewController.webView.keyboardDisplayRequiresUserAction = browserOptions.keyboarddisplayrequiresuseraction;
-        self.themeableBrowserViewController.webView.suppressesIncrementalRendering = browserOptions.suppressesincrementalrendering;
-    }
+    
+    //self.themeableBrowserViewController.webView.scalesPageToFit = browserOptions.zoom;
+    //self.themeableBrowserViewController.webView.mediaPlaybackRequiresUserAction = browserOptions.mediaplaybackrequiresuseraction;
+    //self.themeableBrowserViewController.webView.allowsInlineMediaPlayback = browserOptions.allowinlinemediaplayback;
+    //if (IsAtLeastiOSVersion(@"6.0")) {
+        //self.themeableBrowserViewController.webView.keyboardDisplayRequiresUserAction = browserOptions.keyboarddisplayrequiresuseraction;
+        //self.themeableBrowserViewController.webView.suppressesIncrementalRendering = browserOptions.suppressesincrementalrendering;
+   // }
 
+    self.themeableBrowserViewController.webView.navigationDelegate = self;
     [self.themeableBrowserViewController navigateTo:url];
     if (!browserOptions.hidden) {
         [self show:nil withAnimation:!browserOptions.disableAnimation];
@@ -337,6 +386,7 @@ const float MyFinalProgressValue = 0.9f;
                                    initWithRootViewController:self.themeableBrowserViewController];
     nav.orientationDelegate = self.themeableBrowserViewController;
     nav.navigationBarHidden = YES;
+    nav.modalPresentationStyle = self.themeableBrowserViewController.modalPresentationStyle;
     // Run later to avoid the "took a long time" log message.
     dispatch_async(dispatch_get_main_queue(), ^{
         if (self.themeableBrowserViewController != nil) {
@@ -347,21 +397,9 @@ const float MyFinalProgressValue = 0.9f;
 
 - (void)hide:(CDVInvokedUrlCommand*)command
 {
-    /*
-    if (self.themeableBrowserViewController == nil) {
-        NSLog(@"Tried to hide IAB after it was closed.");
-        return;
-    }
-    if (_previousStatusBarStyle == -1) {
-        NSLog(@"Tried to hide IAB while already hidden");
-        return;
-    }
-    */
-
     if (self.themeableBrowserViewController != nil) {
         [[self.themeableBrowserViewController presentingViewController] dismissViewControllerAnimated:YES completion:nil];
         _isShown = NO;
-        /*_previousStatusBarStyle = -1;*/
     }
 }
 
@@ -402,11 +440,8 @@ const float MyFinalProgressValue = 0.9f;
 
 - (void)injectDeferredObject:(NSString*)source withWrapper:(NSString*)jsWrapper
 {
-    if (!_injectedIframeBridge) {
-        _injectedIframeBridge = YES;
-        // Create an iframe bridge in the new document to communicate with the CDVThemeableBrowserViewController
-        [self.themeableBrowserViewController.webView stringByEvaluatingJavaScriptFromString:@"(function(d){var e = _cdvIframeBridge = d.createElement('iframe');e.style.display='none';d.body.appendChild(e);})(document)"];
-    }
+    // Ensure a message handler bridge is created to communicate with the CDVThemeableBrowserViewController
+    [self evaluateJavaScript: [NSString stringWithFormat:@"(function(w){if(!w._cdvMessageHandler) {w._cdvMessageHandler = function(id,d){w.webkit.messageHandlers.%@.postMessage({d:d, id:id});}}})(window)", IAB_BRIDGE_NAME]];
 
     if (jsWrapper != nil) {
         NSData* jsonData = [NSJSONSerialization dataWithJSONObject:@[source] options:0 error:nil];
@@ -414,11 +449,25 @@ const float MyFinalProgressValue = 0.9f;
         if (sourceArrayString) {
             NSString* sourceString = [sourceArrayString substringWithRange:NSMakeRange(1, [sourceArrayString length] - 2)];
             NSString* jsToInject = [NSString stringWithFormat:jsWrapper, sourceString];
-            [self.themeableBrowserViewController.webView stringByEvaluatingJavaScriptFromString:jsToInject];
+            [self evaluateJavaScript:jsToInject];
         }
     } else {
-        [self.themeableBrowserViewController.webView stringByEvaluatingJavaScriptFromString:source];
+        [self evaluateJavaScript:source];
     }
+}
+
+//Synchronus helper for javascript evaluation
+- (void)evaluateJavaScript:(NSString *)script {
+    __block NSString* _script = script;
+    [self.themeableBrowserViewController.webView evaluateJavaScript:script completionHandler:^(id result, NSError *error) {
+        if (error == nil) {
+            if (result != nil) {
+                NSLog(@"%@", result);
+            }
+        } else {
+            NSLog(@"evaluateJavaScript error : %@ : %@", error.localizedDescription, _script);
+        }
+    }];
 }
 
 - (void)injectScriptCode:(CDVInvokedUrlCommand*)command
@@ -426,7 +475,7 @@ const float MyFinalProgressValue = 0.9f;
     NSString* jsWrapper = nil;
 
     if ((command.callbackId != nil) && ![command.callbackId isEqualToString:@"INVALID"]) {
-        jsWrapper = [NSString stringWithFormat:@"_cdvIframeBridge.src='gap-iab://%@/'+encodeURIComponent(JSON.stringify([eval(%%@)]));", command.callbackId];
+        jsWrapper = [NSString stringWithFormat:@"_cdvMessageHandler('%@',JSON.stringify([eval(%%@)]));", command.callbackId];
     }
     [self injectDeferredObject:[command argumentAtIndex:0] withWrapper:jsWrapper];
 }
@@ -436,7 +485,7 @@ const float MyFinalProgressValue = 0.9f;
     NSString* jsWrapper;
 
     if ((command.callbackId != nil) && ![command.callbackId isEqualToString:@"INVALID"]) {
-        jsWrapper = [NSString stringWithFormat:@"(function(d) { var c = d.createElement('script'); c.src = %%@; c.onload = function() { _cdvIframeBridge.src='gap-iab://%@'; }; d.body.appendChild(c); })(document)", command.callbackId];
+        jsWrapper = [NSString stringWithFormat:@"(function(d) { var c = d.createElement('script'); c.src = %%@; c.onload = function() { _cdvMessageHandler('%@'); }; d.body.appendChild(c); })(document)", command.callbackId];
     } else {
         jsWrapper = @"(function(d) { var c = d.createElement('script'); c.src = %@; d.body.appendChild(c); })(document)";
     }
@@ -448,7 +497,7 @@ const float MyFinalProgressValue = 0.9f;
     NSString* jsWrapper;
 
     if ((command.callbackId != nil) && ![command.callbackId isEqualToString:@"INVALID"]) {
-        jsWrapper = [NSString stringWithFormat:@"(function(d) { var c = d.createElement('style'); c.innerHTML = %%@; c.onload = function() { _cdvIframeBridge.src='gap-iab://%@'; }; d.body.appendChild(c); })(document)", command.callbackId];
+        jsWrapper = [NSString stringWithFormat:@"(function(d) { var c = d.createElement('style'); c.innerHTML = %%@; c.onload = function() { _cdvMessageHandler('%@'); }; d.body.appendChild(c); })(document)", command.callbackId];
     } else {
         jsWrapper = @"(function(d) { var c = d.createElement('style'); c.innerHTML = %@; d.body.appendChild(c); })(document)";
     }
@@ -460,7 +509,7 @@ const float MyFinalProgressValue = 0.9f;
     NSString* jsWrapper;
 
     if ((command.callbackId != nil) && ![command.callbackId isEqualToString:@"INVALID"]) {
-        jsWrapper = [NSString stringWithFormat:@"(function(d) { var c = d.createElement('link'); c.rel='stylesheet'; c.type='text/css'; c.href = %%@; c.onload = function() { _cdvIframeBridge.src='gap-iab://%@'; }; d.body.appendChild(c); })(document)", command.callbackId];
+        jsWrapper = [NSString stringWithFormat:@"(function(d) { var c = d.createElement('link'); c.rel='stylesheet'; c.type='text/css'; c.href = %%@; c.onload = function() { _cdvMessageHandler('%@'); }; d.body.appendChild(c); })(document)", command.callbackId];
     } else {
         jsWrapper = @"(function(d) { var c = d.createElement('link'); c.rel='stylesheet', c.type='text/css'; c.href = %@; d.body.appendChild(c); })(document)";
     }
@@ -499,93 +548,213 @@ const float MyFinalProgressValue = 0.9f;
  * value to pass to the callback. [NSURL path] should take care of the URL-unescaping, and a JSON_EXCEPTION
  * is returned if the JSON is invalid.
  */
-- (BOOL)webView:(UIWebView*)theWebView shouldStartLoadWithRequest:(NSURLRequest*)request navigationType:(UIWebViewNavigationType)navigationType
+
+
+//- (BOOL)webView:(WKWebView*)theWebView shouldStartLoadWithRequest:(NSURLRequest*)request navigationType:(UIWebViewNavigationType)navigationType
+//{
+//    NSURL* url = request.URL;
+//    BOOL isTopLevelNavigation = [request.URL isEqual:[request mainDocumentURL]];
+//
+//    // See if the url uses the 'gap-iab' protocol. If so, the host should be the id of a callback to execute,
+//    // and the path, if present, should be a JSON-encoded value to pass to the callback.
+//    if ([[url scheme] isEqualToString:@"gap-iab"]) {
+//        NSString* scriptCallbackId = [url host];
+//        CDVPluginResult* pluginResult = nil;
+//
+//        if ([self isValidCallbackId:scriptCallbackId]) {
+//            NSString* scriptResult = [url path];
+//            NSError* __autoreleasing error = nil;
+//
+//            // The message should be a JSON-encoded array of the result of the script which executed.
+//            if ((scriptResult != nil) && ([scriptResult length] > 1)) {
+//                scriptResult = [scriptResult substringFromIndex:1];
+//                NSData* decodedResult = [NSJSONSerialization JSONObjectWithData:[scriptResult dataUsingEncoding:NSUTF8StringEncoding] options:kNilOptions error:&error];
+//                if ((error == nil) && [decodedResult isKindOfClass:[NSArray class]]) {
+//                    pluginResult = [CDVPluginResult resultWithStatus:CDVCommandStatus_OK messageAsArray:(NSArray*)decodedResult];
+//                } else {
+//                    pluginResult = [CDVPluginResult resultWithStatus:CDVCommandStatus_JSON_EXCEPTION];
+//                }
+//            } else {
+//                pluginResult = [CDVPluginResult resultWithStatus:CDVCommandStatus_OK messageAsArray:@[]];
+//            }
+//            [self.commandDelegate sendPluginResult:pluginResult callbackId:scriptCallbackId];
+//            return NO;
+//        }
+//    } else if ([self isSystemUrl:url]) {
+//      // Do not allow iTunes store links from ThemeableBrowser as they do not work
+//      // instead open them with App Store app or Safari
+//      [[UIApplication sharedApplication] openURL:url];
+//
+//      // only in the case where a redirect link is opened in a freshly started
+//      // ThemeableBrowser frame, trigger ThemeableBrowserRedirectExternalOnOpen
+//      // event. This event can be handled in the app-side -- for instance, to
+//      // close the ThemeableBrowser as the frame will contain a blank page
+//      if (
+//        originalUrl != nil
+//        && [[originalUrl absoluteString] isEqualToString:[initUrl absoluteString]]
+//        && _framesOpened == 1
+//      ) {
+//        NSDictionary *event = @{
+//          @"type": @"ThemeableBrowserRedirectExternalOnOpen",
+//          @"message": @"ThemeableBrowser redirected to open an external app on fresh start"
+//        };
+//
+//        [self emitEvent:event];
+//      }
+//
+//      // do not load content in the web view since this URL is handled by an
+//      // external app
+//      return NO;
+//    } else if ((self.callbackId != nil) && isTopLevelNavigation) {
+//        // Send a loadstart event for each top-level navigation (includes redirects).
+//        CDVPluginResult* pluginResult = [CDVPluginResult resultWithStatus:CDVCommandStatus_OK
+//                                                      messageAsDictionary:@{@"type":@"loadstart", @"url":[url absoluteString]}];
+//        [pluginResult setKeepCallback:[NSNumber numberWithBool:YES]];
+//
+//        [self.commandDelegate sendPluginResult:pluginResult callbackId:self.callbackId];
+//    }
+//
+//    // originalUrl is used to detect redirect. This works by storing the
+//    // request URL of the original frame when it's about to be loaded. A redirect
+//    // will cause shouldStartLoadWithRequest to be called again before the
+//    // original frame finishes loading (originalUrl becomes nil upon the frame
+//    // finishing loading). On second time shouldStartLoadWithRequest
+//    // is called, this stored original frame's URL can be compared against
+//    // the URL of the new request. A mismatch implies redirect.
+//    originalUrl = request.URL;
+//
+//    return YES;
+//}
+
+- (void)webViewDidStartLoad:(WKWebView*)theWebView
 {
+    _framesOpened++;
+}
+
+
+- (void)webView:(WKWebView *)webView decidePolicyForNavigationAction:(WKNavigationAction *)navigationAction decisionHandler:(void (^)(WKNavigationActionPolicy))decisionHandler {
+    
+    NSURLRequest *request = navigationAction.request;
+    self.themeableBrowserViewController.currentURL = request.URL;
+
     NSURL* url = request.URL;
-    BOOL isTopLevelNavigation = [request.URL isEqual:[request mainDocumentURL]];
-
-    // See if the url uses the 'gap-iab' protocol. If so, the host should be the id of a callback to execute,
-    // and the path, if present, should be a JSON-encoded value to pass to the callback.
-    if ([[url scheme] isEqualToString:@"gap-iab"]) {
-        NSString* scriptCallbackId = [url host];
-        CDVPluginResult* pluginResult = nil;
-
-        if ([self isValidCallbackId:scriptCallbackId]) {
-            NSString* scriptResult = [url path];
-            NSError* __autoreleasing error = nil;
-
-            // The message should be a JSON-encoded array of the result of the script which executed.
-            if ((scriptResult != nil) && ([scriptResult length] > 1)) {
-                scriptResult = [scriptResult substringFromIndex:1];
-                NSData* decodedResult = [NSJSONSerialization JSONObjectWithData:[scriptResult dataUsingEncoding:NSUTF8StringEncoding] options:kNilOptions error:&error];
-                if ((error == nil) && [decodedResult isKindOfClass:[NSArray class]]) {
-                    pluginResult = [CDVPluginResult resultWithStatus:CDVCommandStatus_OK messageAsArray:(NSArray*)decodedResult];
-                } else {
-                    pluginResult = [CDVPluginResult resultWithStatus:CDVCommandStatus_JSON_EXCEPTION];
-                }
-            } else {
-                pluginResult = [CDVPluginResult resultWithStatus:CDVCommandStatus_OK messageAsArray:@[]];
-            }
-            [self.commandDelegate sendPluginResult:pluginResult callbackId:scriptCallbackId];
-            return NO;
-        }
+    NSURL* mainDocumentURL = request.mainDocumentURL;
+    BOOL isTopLevelNavigation = [url isEqual:mainDocumentURL];
+    BOOL shouldStart = YES;
+    
+    //if is an app store link, let the system handle it, otherwise it fails to load it
+    if ([[ url scheme] isEqualToString:@"itms-appss"] || [[ url scheme] isEqualToString:@"itms-apps"]) {
+        [webView stopLoading];
+        [self openInSystem:url];
+        shouldStart = NO;
     } else if ([self isSystemUrl:url]) {
-      // Do not allow iTunes store links from ThemeableBrowser as they do not work
-      // instead open them with App Store app or Safari
-      [[UIApplication sharedApplication] openURL:url];
-
-      // only in the case where a redirect link is opened in a freshly started
-      // ThemeableBrowser frame, trigger ThemeableBrowserRedirectExternalOnOpen
-      // event. This event can be handled in the app-side -- for instance, to
-      // close the ThemeableBrowser as the frame will contain a blank page
-      if (
-        originalUrl != nil
-        && [[originalUrl absoluteString] isEqualToString:[initUrl absoluteString]]
-        && _framesOpened == 1
-      ) {
-        NSDictionary *event = @{
-          @"type": @"ThemeableBrowserRedirectExternalOnOpen",
-          @"message": @"ThemeableBrowser redirected to open an external app on fresh start"
-        };
-
-        [self emitEvent:event];
-      }
-
-      // do not load content in the web view since this URL is handled by an
-      // external app
-      return NO;
+        // Do not allow iTunes store links from ThemeableBrowser as they do not work
+        // instead open them with App Store app or Safari
+        [webView stopLoading];
+        [self openInSystem:url];
+        
+        // only in the case where a redirect link is opened in a freshly started
+        // ThemeableBrowser frame, trigger ThemeableBrowserRedirectExternalOnOpen
+        // event. This event can be handled in the app-side -- for instance, to
+        // close the ThemeableBrowser as the frame will contain a blank page
+        if (
+            originalUrl != nil
+            && [[originalUrl absoluteString] isEqualToString:[initUrl absoluteString]]
+            && _framesOpened == 1
+            ) {
+            NSDictionary *event = @{
+                                    @"type": @"ThemeableBrowserRedirectExternalOnOpen",
+                                    @"message": @"ThemeableBrowser redirected to open an external app on fresh start"
+                                    };
+            
+            [self emitEvent:event];
+        }
+        
+        // do not load content in the web view since this URL is handled by an
+        // external app
+        shouldStart = NO;
     } else if ((self.callbackId != nil) && isTopLevelNavigation) {
         // Send a loadstart event for each top-level navigation (includes redirects).
         CDVPluginResult* pluginResult = [CDVPluginResult resultWithStatus:CDVCommandStatus_OK
                                                       messageAsDictionary:@{@"type":@"loadstart", @"url":[url absoluteString]}];
         [pluginResult setKeepCallback:[NSNumber numberWithBool:YES]];
-
+        
         [self.commandDelegate sendPluginResult:pluginResult callbackId:self.callbackId];
     }
+    
+    if(shouldStart){
+        // Fix GH-417 & GH-424: Handle non-default target attribute
+        // Based on https://stackoverflow.com/a/25713070/777265
+        if (!navigationAction.targetFrame){
+            [webView loadRequest:navigationAction.request];
+            decisionHandler(WKNavigationActionPolicyCancel);
+        }else{
 
-    // originalUrl is used to detect redirect. This works by storing the
-    // request URL of the original frame when it's about to be loaded. A redirect
-    // will cause shouldStartLoadWithRequest to be called again before the
-    // original frame finishes loading (originalUrl becomes nil upon the frame
-    // finishing loading). On second time shouldStartLoadWithRequest
-    // is called, this stored original frame's URL can be compared against
-    // the URL of the new request. A mismatch implies redirect.
-    originalUrl = request.URL;
+            // originalUrl is used to detect redirect. This works by storing the
+            // request URL of the original frame when it's about to be loaded. A redirect
+            // will cause shouldStartLoadWithRequest to be called again before the
+            // original frame finishes loading (originalUrl becomes nil upon the frame
+            // finishing loading). On second time shouldStartLoadWithRequest
+            // is called, this stored original frame's URL can be compared against
+            // the URL of the new request. A mismatch implies redirect.
+            originalUrl = request.URL;
 
-    return YES;
+            decisionHandler(WKNavigationActionPolicyAllow);
+        }
+    }else{
+        decisionHandler(WKNavigationActionPolicyCancel);
+    }
 }
 
-- (void)webViewDidStartLoad:(UIWebView*)theWebView
-{
-    _injectedIframeBridge = NO;
-    _framesOpened++;
+#pragma mark WKScriptMessageHandler delegate
+- (void)userContentController:(nonnull WKUserContentController *)userContentController didReceiveScriptMessage:(nonnull WKScriptMessage *)message {
+    
+    CDVPluginResult* pluginResult = nil;
+    
+    if([message.body isKindOfClass:[NSDictionary class]]){
+        NSDictionary* messageContent = (NSDictionary*) message.body;
+        NSString* scriptCallbackId = messageContent[@"id"];
+        
+        if([messageContent objectForKey:@"d"]){
+            NSString* scriptResult = messageContent[@"d"];
+            NSError* __autoreleasing error = nil;
+            NSData* decodedResult = [NSJSONSerialization JSONObjectWithData:[scriptResult dataUsingEncoding:NSUTF8StringEncoding] options:kNilOptions error:&error];
+            if ((error == nil) && [decodedResult isKindOfClass:[NSArray class]]) {
+                pluginResult = [CDVPluginResult resultWithStatus:CDVCommandStatus_OK messageAsArray:(NSArray*)decodedResult];
+            } else {
+                pluginResult = [CDVPluginResult resultWithStatus:CDVCommandStatus_JSON_EXCEPTION];
+            }
+        } else {
+            pluginResult = [CDVPluginResult resultWithStatus:CDVCommandStatus_OK messageAsArray:@[]];
+        }
+        [self.commandDelegate sendPluginResult:pluginResult callbackId:scriptCallbackId];
+    }else if(self.callbackId != nil){
+        // Send a message event
+        NSString* messageContent = (NSString*) message.body;
+        NSError* __autoreleasing error = nil;
+        NSData* decodedResult = [NSJSONSerialization JSONObjectWithData:[messageContent dataUsingEncoding:NSUTF8StringEncoding] options:kNilOptions error:&error];
+        if (error == nil) {
+            NSMutableDictionary* dResult = [NSMutableDictionary new];
+            [dResult setValue:@"message" forKey:@"type"];
+            [dResult setObject:decodedResult forKey:@"data"];
+            CDVPluginResult* pluginResult = [CDVPluginResult resultWithStatus:CDVCommandStatus_OK messageAsDictionary:dResult];
+            [pluginResult setKeepCallback:[NSNumber numberWithBool:YES]];
+            [self.commandDelegate sendPluginResult:pluginResult callbackId:self.callbackId];
+        }
+    }
 }
 
-- (void)webViewDidFinishLoad:(UIWebView*)theWebView
-{
+- (void)webView:(WKWebView *)webView didFinishNavigation:(WKNavigation *)navigation {
     if (self.callbackId != nil) {
-        // TODO: It would be more useful to return the URL the page is actually on (e.g. if it's been redirected).
-        NSString* url = [self.themeableBrowserViewController.currentURL absoluteString];
+        NSString* url = [webView.URL absoluteString];
+        if(url == nil){
+            if(self.themeableBrowserViewController.currentURL != nil){
+                url = [self.themeableBrowserViewController.currentURL absoluteString];
+            }else{
+                url = @"";
+            }
+        }
+
         CDVPluginResult* pluginResult = [CDVPluginResult resultWithStatus:CDVCommandStatus_OK
                                                       messageAsDictionary:@{@"type":@"loadstop", @"url":url}];
         [pluginResult setKeepCallback:[NSNumber numberWithBool:YES]];
@@ -598,7 +767,8 @@ const float MyFinalProgressValue = 0.9f;
     }
 }
 
-- (void)webView:(UIWebView*)theWebView didFailLoadWithError:(NSError*)error
+
+- (void)webView:(WKWebView*)theWebView didFailLoadWithError:(NSError*)error
 {
     if (self.callbackId != nil) {
         NSString* url = [self.themeableBrowserViewController.currentURL absoluteString];
@@ -667,19 +837,6 @@ const float MyFinalProgressValue = 0.9f;
 
 #pragma mark CDVThemeableBrowserViewController
 
-@interface CDVThemeableBrowserViewController ()
- {
-     NSUInteger loadingCount;
-     NSUInteger maxLoadCount;
-
-     NSURL *currentURL;
-
-     CGFloat currentLoadProgress;
-
-     BOOL interactive;
- }
-@end
-
 @implementation CDVThemeableBrowserViewController
 
 @synthesize currentURL;
@@ -691,17 +848,20 @@ const float MyFinalProgressValue = 0.9f;
         _userAgent = userAgent;
         _prevUserAgent = prevUserAgent;
         _browserOptions = browserOptions;
-#ifdef __CORDOVA_4_0_0
-        _webViewDelegate = [[CDVUIWebViewDelegate alloc] initWithDelegate:self];
-#else
-        _webViewDelegate = [[CDVWebViewDelegate alloc] initWithDelegate:self];
-#endif
+        //_webViewDelegate = [[CDVWKWebViewUIDelegate alloc] init];
+        
+
+
+//#ifdef __CORDOVA_9_0_0
+////        _webViewDelegate = [[kCDVWebViewEngineWKUIDelegate alloc] initWithDelegate:self];
+////        _webNavigationDelegate = [[kCDVWebViewEngineWKNavigationDelegate alloc] initwithDelegate:self];
+//
+////#else
+////        _webViewDelegate = [[kCDVWebViewEngineWKUIDelegate alloc] initWithDelegate:self];
+////        _webNavigationDelegate = [[kCDVWebViewEngineWKNavigationDelegate alloc] initwithDelegate:self];
+//#endif
         _navigationDelegate = navigationDelegate;
         _statusBarStyle = statusBarStyle;
-         maxLoadCount = loadingCount = 0;
-         //默认值currentLoadProgress = 99;
-         currentLoadProgress = 99;
-         interactive = NO;
         [self createViews];
     }
 
@@ -719,23 +879,55 @@ const float MyFinalProgressValue = 0.9f;
     if (!_browserOptions.fullscreen) {
         webViewBounds.size.height -= toolbarHeight;
     }
-    self.webView = [[UIWebView alloc] initWithFrame:webViewBounds];
+    WKUserContentController* userContentController = [[WKUserContentController alloc] init];
+    
+    WKWebViewConfiguration* configuration = [[WKWebViewConfiguration alloc] init];
+    configuration.userContentController = userContentController;
+#if __has_include("CDVWKProcessPoolFactory.h")
+    configuration.processPool = [[CDVWKProcessPoolFactory sharedFactory] sharedProcessPool];
+#endif
+    [configuration.userContentController addScriptMessageHandler:self name:IAB_BRIDGE_NAME];
+    
+    //WKWebView options
+    configuration.allowsInlineMediaPlayback = _browserOptions.allowinlinemediaplayback;
+    if (IsAtLeastiOSVersion(@"10.0")) {
+        configuration.ignoresViewportScaleLimits = _browserOptions.enableviewportscale;
+        if(_browserOptions.mediaplaybackrequiresuseraction == YES){
+            configuration.mediaTypesRequiringUserActionForPlayback = WKAudiovisualMediaTypeAll;
+        }else{
+            configuration.mediaTypesRequiringUserActionForPlayback = WKAudiovisualMediaTypeNone;
+        }
+    }else{ // iOS 9
+        configuration.mediaPlaybackRequiresUserAction = _browserOptions.mediaplaybackrequiresuseraction;
+    }
+
+    self.webView = [[WKWebView alloc] initWithFrame:webViewBounds configuration:configuration];
 
     self.webView.autoresizingMask = (UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight);
 
     [self.view addSubview:self.webView];
     [self.view sendSubviewToBack:self.webView];
 
-    self.webView.delegate = _webViewDelegate;
+    self.webView.navigationDelegate = self;
+
     self.webView.backgroundColor = [UIColor whiteColor];
+    if (_browserOptions.customUserAgent) {
+        self.webView.customUserAgent = _browserOptions.customUserAgent;
+    }
 
     self.webView.clearsContextBeforeDrawing = YES;
     self.webView.clipsToBounds = YES;
     self.webView.contentMode = UIViewContentModeScaleToFill;
     self.webView.multipleTouchEnabled = YES;
     self.webView.opaque = YES;
-    self.webView.scalesPageToFit = NO;
     self.webView.userInteractionEnabled = YES;
+    self.webView.allowsBackForwardNavigationGestures = _browserOptions.allowsBackForwardNavigationGestures;
+    if (_browserOptions.allowsBackForwardNavigationGestures) {
+        UISwipeGestureRecognizer *swipeRight = [[UISwipeGestureRecognizer alloc] initWithTarget:self action:@selector(handleSwipe:)];
+        [swipeRight setDirection:UISwipeGestureRecognizerDirectionRight];
+        [self.view addGestureRecognizer:swipeRight];
+    }
+    self.webView.UIDelegate = self;
 
     self.spinner = [[UIActivityIndicatorView alloc] initWithActivityIndicatorStyle:UIActivityIndicatorViewStyleWhite];
     self.spinner.alpha = 1.000;
@@ -818,6 +1010,7 @@ const float MyFinalProgressValue = 0.9f;
     self.closeButton = [self createButton:_browserOptions.closeButton action:@selector(close) withDescription:@"close button"];
     self.backButton = [self createButton:_browserOptions.backButton action:@selector(goBack:) withDescription:@"back button"];
     self.forwardButton = [self createButton:_browserOptions.forwardButton action:@selector(goForward:) withDescription:@"forward button"];
+    self.reloadButton = [self createButton:_browserOptions.reloadButton action:@selector(doReload:) withDescription:@"reload button"];
     self.menuButton = [self createButton:_browserOptions.menu action:@selector(goMenu:) withDescription:@"menu button"];
 
     // Arramge toolbar buttons with respect to user configuration.
@@ -852,6 +1045,11 @@ const float MyFinalProgressValue = 0.9f;
         }
     }
 
+    BOOL showFirstTime = [self getBoolFromDict:_browserOptions.backButton withKey:kThemeableBrowserPropShowFirstTime];
+    if (showFirstTime == false) {
+        self.backButton.hidden = YES;
+    }
+
     // Back and forward buttons must be added with special ordering logic such
     // that back button is always on the left of forward button if both buttons
     // are on the same side.
@@ -873,6 +1071,18 @@ const float MyFinalProgressValue = 0.9f;
         leftWidth += width;
     }
 
+    if (self.reloadButton && [kThemeableBrowserAlignRight isEqualToString:_browserOptions.reloadButton[kThemeableBrowserPropAlign]]) {
+        CGFloat width = [self getWidthFromButton:self.reloadButton];
+        [rightButtons addObject:self.reloadButton];
+        rightWidth += width;
+    }
+    
+    if (self.reloadButton && ![kThemeableBrowserAlignRight isEqualToString:_browserOptions.reloadButton[kThemeableBrowserPropAlign]]) {
+        CGFloat width = [self getWidthFromButton:self.reloadButton];
+        [leftButtons addObject:self.reloadButton];
+        leftWidth += width;
+    }
+
     if (self.backButton && [kThemeableBrowserAlignRight isEqualToString:_browserOptions.backButton[kThemeableBrowserPropAlign]]) {
         CGFloat width = [self getWidthFromButton:self.backButton];
         [rightButtons addObject:self.backButton];
@@ -881,12 +1091,14 @@ const float MyFinalProgressValue = 0.9f;
 
     NSArray* customButtons = _browserOptions.customButtons;
     if (customButtons) {
-        NSInteger cnt = 0;
+        NSInteger cnt = [customButtons count]-1;
+
         // Reverse loop because we are laying out from outer to inner.
         for (NSDictionary* customButton in [customButtons reverseObjectEnumerator]) {
             UIButton* button = [self createButton:customButton action:@selector(goCustomButton:) withDescription:[NSString stringWithFormat:@"custom button at %ld", (long)cnt]];
             if (button) {
-                button.tag = cnt;
+                button.tag = cnt+TAG_SALT;
+
                 CGFloat width = [self getWidthFromButton:button];
                 if ([kThemeableBrowserAlignRight isEqualToString:customButton[kThemeableBrowserPropAlign]]) {
                     [rightButtons addObject:button];
@@ -897,7 +1109,7 @@ const float MyFinalProgressValue = 0.9f;
                 }
             }
 
-            cnt += 1;
+            cnt -= 1;
         }
     }
 
@@ -929,6 +1141,11 @@ const float MyFinalProgressValue = 0.9f;
             self.titleLabel.text = _browserOptions.title[kThemeableBrowserPropStaticText];
         }
 
+        if (_browserOptions.title[kThemeableBrowserPropSize]) {
+            CGFloat textSize = [self getFloatFromDict:_browserOptions.title withKey:kThemeableBrowserPropSize withDefault:13.0];
+            self.titleLabel.font = [UIFont boldSystemFontOfSize:textSize];
+        }
+
         [self.toolbar addSubview:self.titleLabel];
     }
 
@@ -940,10 +1157,48 @@ const float MyFinalProgressValue = 0.9f;
     self.progressView.progressTintColor=[CDVThemeableBrowserViewController colorFromRGBA:[self getStringFromDict:_browserOptions.browserProgress withKey: kThemeableBrowserPropProgressColor withDefault:@"#0000FF"]];
     self.progressView.trackTintColor=[CDVThemeableBrowserViewController colorFromRGBA:[self getStringFromDict:_browserOptions.browserProgress withKey:kThemeableBrowserPropProgressBgColor withDefault:@"#808080"]];
     if ([self getBoolFromDict:_browserOptions.browserProgress withKey:kThemeableBrowserPropShowProgress]) {
+        UISwipeGestureRecognizer *swipeRight = [[UISwipeGestureRecognizer alloc] initWithTarget:self action:@selector(handleSwipe:)];
+        [swipeRight setDirection:UISwipeGestureRecognizerDirectionRight];
+        [self.view addGestureRecognizer:swipeRight];
         [self.view addSubview:self.progressView];
+        [self.webView addObserver:self forKeyPath:@"estimatedProgress" options:NSKeyValueObservingOptionNew context:nil];
     }
-    // [self.view addSubview:self.addressLabel];
-    // [self.view addSubview:self.spinner];
+}
+
+- (nullable WKWebView *)webView:(WKWebView *)webView createWebViewWithConfiguration:(WKWebViewConfiguration *)configuration forNavigationAction:(WKNavigationAction *)navigationAction windowFeatures:(WKWindowFeatures *)windowFeatures
+{
+    if (!navigationAction.targetFrame) {
+        [webView loadRequest:navigationAction.request];
+    }
+
+    return nil;
+}
+
+
+- (void)handleSwipe:(UISwipeGestureRecognizer *)swipe {
+    // If there is no back history and backButtonCanClose is enabled, close the browser.
+    if (swipe.direction == UISwipeGestureRecognizerDirectionRight && !self.webView.canGoBack && _browserOptions.backButtonCanClose) {
+        [self close];
+    }
+}
+
+- (void)observeValueForKeyPath:(NSString *)keyPath ofObject:(id)object change:(NSDictionary *)change context:(void *)context
+{
+    if ([keyPath isEqualToString:@"estimatedProgress"]) {
+        // Update progress bar when estimatedProgress changes
+         self.progressView.alpha = 1.0;
+        [self.progressView setProgress:self.webView.estimatedProgress animated:YES];
+        if(self.webView.estimatedProgress >= 1.0f) {
+            [UIView animateWithDuration:0.3 delay:0.3 options:UIViewAnimationOptionCurveEaseOut animations:^{
+              [self.progressView setAlpha:0.0f];
+            } completion:^(BOOL finished) {
+              [self.progressView setProgress:0.0f animated:NO];
+            }];
+         }
+    } else {
+        [super observeValueForKeyPath:keyPath ofObject:object change:change context:context];
+    }
+
 }
 
 /**
@@ -1230,6 +1485,10 @@ const float MyFinalProgressValue = 0.9f;
     [CDVUserAgentUtil releaseLock:&_userAgentLockToken];
     self.currentURL = nil;
 
+    if ([self getBoolFromDict:_browserOptions.browserProgress withKey:kThemeableBrowserPropShowProgress]) {
+        [self.webView removeObserver:self forKeyPath:@"estimatedProgress"];
+    }
+
     if ((self.navigationDelegate != nil) && [self.navigationDelegate respondsToSelector:@selector(browserExit)]) {
         [self.navigationDelegate browserExit];
     }
@@ -1248,6 +1507,17 @@ const float MyFinalProgressValue = 0.9f;
 - (void)reload
 {
     [self.webView reload];
+}
+
+- (void)changeButtonImage:(NSInteger) buttonIndex buttonProps:(NSDictionary *)buttonProps {
+    
+    UIButton* button = (UIButton *)[self.toolbar viewWithTag:buttonIndex+TAG_SALT];
+    UIImage *image = [self getImage:buttonProps[kThemeableBrowserPropImage]
+                            altPath:buttonProps[kThemeableBrowserPropWwwImage]
+                         altDensity:[buttonProps[kThemeableBrowserPropWwwImageDensity] doubleValue]];
+    if(button && image){
+        [button setImage:image forState:UIControlStateNormal];
+    }
 }
 
 - (void)navigateTo:(NSURL*)url
@@ -1285,10 +1555,18 @@ const float MyFinalProgressValue = 0.9f;
     [self updateButtonDelayed:self.webView];
 }
 
+- (void)doReload:(id)sender
+{
+    [self emitEventForButton:_browserOptions.reloadButton];
+    
+    [self.webView reload];
+    [self updateButtonDelayed:self.webView];
+}
+
 - (void)goCustomButton:(id)sender
 {
     UIButton* button = sender;
-    NSInteger index = button.tag;
+    NSInteger index = button.tag-TAG_SALT;
     [self emitEventForButton:_browserOptions.customButtons[index] withIndex:[NSNumber numberWithLong:index]];
 }
 
@@ -1389,13 +1667,14 @@ const float MyFinalProgressValue = 0.9f;
 }
 
 - (void) rePositionViews {
-  // Webview height is a bug that appear in the plugin for ios >= 11 so we need to keep the previous code that work great for previous versions
-  if (@available(iOS 11, *)) {
 
+    // Webview height is a bug that appear in the plugin for ios >= 11 so we need to keep the previous code that work great for previous versions
+    if (@available(iOS 11, *)) {
+        
         CGFloat toolbarHeight = [self getFloatFromDict:_browserOptions.toolbar withKey:kThemeableBrowserPropHeight withDefault:TOOLBAR_DEF_HEIGHT];
         CGFloat statusBarOffset = [self getStatusBarOffset];
         CGFloat webviewOffset = _browserOptions.fullscreen ? 0.0 : toolbarHeight + statusBarOffset;
-
+        
         if ([_browserOptions.toolbarposition isEqualToString:kThemeableBrowserToolbarBarPositionTop]) {
             // The webview height calculated did not take the status bar into account. Thus we need to remove status bar height to the webview height.
             [self.webView setFrame:CGRectMake(self.webView.frame.origin.x, webviewOffset, self.webView.frame.size.width, (self.webView.frame.size.height-statusBarOffset))];
@@ -1405,31 +1684,32 @@ const float MyFinalProgressValue = 0.9f;
         if (statusBarOffset == 0) {
             [self.webView setFrame:CGRectMake(self.webView.frame.origin.x, webviewOffset, self.webView.frame.size.width, (self.webView.frame.size.height+20))];
         }
-
+        
         CGFloat screenWidth = CGRectGetWidth(self.view.frame);
         NSInteger width = floorf(screenWidth - self.titleOffset * 2.0f);
         if (self.titleLabel) {
             self.titleLabel.frame = CGRectMake(floorf((screenWidth - width) / 2.0f), 0, width, toolbarHeight);
         }
-
+        
         [self layoutButtons];
-
+        
     } else {
-      CGFloat toolbarHeight = [self getFloatFromDict:_browserOptions.toolbar withKey:kThemeableBrowserPropHeight withDefault:TOOLBAR_DEF_HEIGHT];
-      CGFloat webviewOffset = _browserOptions.fullscreen ? 0.0 : toolbarHeight;
-
-      if ([_browserOptions.toolbarposition isEqualToString:kThemeableBrowserToolbarBarPositionTop]) {
-          [self.webView setFrame:CGRectMake(self.webView.frame.origin.x, webviewOffset, self.webView.frame.size.width, self.webView.frame.size.height)];
-          [self.toolbar setFrame:CGRectMake(self.toolbar.frame.origin.x, [self getStatusBarOffset], self.toolbar.frame.size.width, self.toolbar.frame.size.height)];
-      }
-
-      CGFloat screenWidth = CGRectGetWidth(self.view.frame);
-      NSInteger width = floorf(screenWidth - self.titleOffset * 2.0f);
-      if (self.titleLabel) {
-          self.titleLabel.frame = CGRectMake(floorf((screenWidth - width) / 2.0f), 0, width, toolbarHeight);
-      }
-
-      [self layoutButtons];
+        
+        CGFloat toolbarHeight = [self getFloatFromDict:_browserOptions.toolbar withKey:kThemeableBrowserPropHeight withDefault:TOOLBAR_DEF_HEIGHT];
+        CGFloat webviewOffset = _browserOptions.fullscreen ? 0.0 : toolbarHeight;
+        
+        if ([_browserOptions.toolbarposition isEqualToString:kThemeableBrowserToolbarBarPositionTop]) {
+            [self.webView setFrame:CGRectMake(self.webView.frame.origin.x, webviewOffset, self.webView.frame.size.width, self.webView.frame.size.height)];
+            [self.toolbar setFrame:CGRectMake(self.toolbar.frame.origin.x, [self getStatusBarOffset], self.toolbar.frame.size.width, self.toolbar.frame.size.height)];
+        }
+        
+        CGFloat screenWidth = CGRectGetWidth(self.view.frame);
+        NSInteger width = floorf(screenWidth - self.titleOffset * 2.0f);
+        if (self.titleLabel) {
+            self.titleLabel.frame = CGRectMake(floorf((screenWidth - width) / 2.0f), 0, width, toolbarHeight);
+        }
+        
+        [self layoutButtons];
     }
 }
 
@@ -1490,228 +1770,117 @@ const float MyFinalProgressValue = 0.9f;
     }
 }
 
+
 #pragma mark UIWebViewDelegate
 
-- (void)webViewDidStartLoad:(UIWebView*)theWebView
-{
-    // loading url, start spinner
+// These UIWebView delegates won't fire due to the switch to WKWebView.
 
-    self.addressLabel.text = NSLocalizedString(@"Loading...", nil);
-    loadingCount++;
-    maxLoadCount = fmax(maxLoadCount, loadingCount);
+//- (void)webViewDidStartLoad:(UIWebView*)theWebView
+//{
+//    // loading url, start spinner
+//
+//    self.addressLabel.text = NSLocalizedString(@"Loading...", nil);
+//
+//    [self.spinner startAnimating];
+//
+//    return [self.navigationDelegate webViewDidStartLoad:theWebView];
+//}
 
-    [self.spinner startAnimating];
+//- (BOOL)webView:(WKWebView*)theWebView shouldStartLoadWithRequest:(NSURLRequest*)request navigationType:(UIWebViewNavigationType)navigationType
+//{
+//    BOOL isTopLevelNavigation = [request.URL isEqual:[request mainDocumentURL]];
+//
+//    if (isTopLevelNavigation) {
+//        self.currentURL = request.URL;
+//    }
+//
+//    [self updateButtonDelayed:theWebView];
+//
+//    return [self.navigationDelegate webView:theWebView shouldStartLoadWithRequest:request navigationType:navigationType];
+//}
 
-    // return [self.navigationDelegate webViewDidStartLoad:theWebView];
-    [self.navigationDelegate webViewDidStartLoad:theWebView];
-    [self startProgress:theWebView];
-}
+//- (void)webViewDidFinishLoad:(UIWebView*)theWebView
+//{
+//    // update url, stop spinner, update back/forward
+//
+//    self.addressLabel.text = [self.currentURL absoluteString];
+//    [self updateButton:theWebView];
+//
+//    if (self.titleLabel && _browserOptions.title
+//            && !_browserOptions.title[kThemeableBrowserPropStaticText]
+//            && [self getBoolFromDict:_browserOptions.title withKey:kThemeableBrowserPropShowPageTitle]) {
+//        // Update title text to page title when title is shown and we are not
+//        // required to show a static text.
+//
+//        [self.webView evaluateJavaScript:@"document.title" completionHandler:^(NSString *result, NSError *error) {
+//            self.titleLabel.text = result;
+//        }];
+//        //self.titleLabel.text = [self.webView stringByEvaluatingJavaScriptFromString:@"document.title"];
+//    }
+//
+//    [self.spinner stopAnimating];
+//
+//    // Work around a bug where the first time a PDF is opened, all UIWebViews
+//    // reload their User-Agent from NSUserDefaults.
+//    // This work-around makes the following assumptions:
+//    // 1. The app has only a single Cordova Webview. If not, then the app should
+//    //    take it upon themselves to load a PDF in the background as a part of
+//    //    their start-up flow.
+//    // 2. That the PDF does not require any additional network requests. We change
+//    //    the user-agent here back to that of the CDVViewController, so requests
+//    //    from it must pass through its white-list. This *does* break PDFs that
+//    //    contain links to other remote PDF/websites.
+//    // More info at https://issues.apache.org/jira/browse/CB-2225
+//    __block BOOL isPDF;
+//    [theWebView evaluateJavaScript:@"document.body==null" completionHandler:^(NSString *result, NSError *error) {
+//        if([result isEqualToString:@"true"]) {
+//            isPDF = true;
+//        } else {
+//            isPDF = false;
+//        }
+//    }];
+//
+//    //BOOL isPDF = [@"true" isEqualToString :[theWebView stringByEvaluatingJavaScriptFromString:@"document.body==null"]];
+//    if (isPDF) {
+//        [CDVUserAgentUtil setUserAgent:_prevUserAgent lockToken:_userAgentLockToken];
+//    }
+//
+//    //[self.navigationDelegate webViewDidFinishLoad:theWebView];
+//}
+//
+//- (void)webView:(UIWebView*)theWebView didFailLoadWithError:(NSError*)error
+//{
+//    [self updateButton:theWebView];
+//
+//    [self.spinner stopAnimating];
+//
+//    self.addressLabel.text = NSLocalizedString(@"Load Error", nil);
+//
+//    [self.navigationDelegate webView:theWebView didFailLoadWithError:error];
+//}
 
-- (BOOL)webView:(UIWebView*)theWebView shouldStartLoadWithRequest:(NSURLRequest*)request navigationType:(UIWebViewNavigationType)navigationType
-{
-    // BOOL isTopLevelNavigation = [request.URL isEqual:[request mainDocumentURL]];
-    if ([request.URL.path isEqualToString:completeRPCURLPath]) {
-        [self completeProgress:theWebView];
-        return NO;
-    }
-
-    BOOL ret = [self.navigationDelegate webView:theWebView shouldStartLoadWithRequest:request navigationType:navigationType];
-    BOOL isFragmentJump = NO;
-    if (request.URL.fragment) {
-        NSString *nonFragmentURL = [request.URL.absoluteString stringByReplacingOccurrencesOfString:[@"#" stringByAppendingString:request.URL.fragment] withString:@""];
-        isFragmentJump = [nonFragmentURL isEqualToString:theWebView.request.URL.absoluteString];
-    }
-
-    BOOL isTopLevelNavigation = [request.mainDocumentURL isEqual:request.URL];
-
-    BOOL isHTTP = [request.URL.scheme isEqualToString:@"http"] || [request.URL.scheme isEqualToString:@"https"];
-    if (ret && !isFragmentJump && isHTTP && isTopLevelNavigation) {
-        currentURL = request.URL;
-        [self reset:theWebView];
-    }
-    if (isTopLevelNavigation) {
-        self.currentURL = request.URL;
-    }
-
-    [self updateButtonDelayed:theWebView];
-
-    // return [self.navigationDelegate webView:theWebView shouldStartLoadWithRequest:request navigationType:navigationType];
-    return ret;
-}
-
-- (void)webViewDidFinishLoad:(UIWebView*)theWebView
-{
-    // update url, stop spinner, update back/forward
-
-    self.addressLabel.text = [self.currentURL absoluteString];
-    [self updateButton:theWebView];
-
-    if (self.titleLabel && _browserOptions.title
-            && !_browserOptions.title[kThemeableBrowserPropStaticText]
-            && [self getBoolFromDict:_browserOptions.title withKey:kThemeableBrowserPropShowPageTitle]) {
-        // Update title text to page title when title is shown and we are not
-        // required to show a static text.
-        self.titleLabel.text = [self.webView stringByEvaluatingJavaScriptFromString:@"document.title"];
-    }
-
-    [self.spinner stopAnimating];
-
-    // Work around a bug where the first time a PDF is opened, all UIWebViews
-    // reload their User-Agent from NSUserDefaults.
-    // This work-around makes the following assumptions:
-    // 1. The app has only a single Cordova Webview. If not, then the app should
-    //    take it upon themselves to load a PDF in the background as a part of
-    //    their start-up flow.
-    // 2. That the PDF does not require any additional network requests. We change
-    //    the user-agent here back to that of the CDVViewController, so requests
-    //    from it must pass through its white-list. This *does* break PDFs that
-    //    contain links to other remote PDF/websites.
-    // More info at https://issues.apache.org/jira/browse/CB-2225
-    BOOL isPDF = [@"true" isEqualToString :[theWebView stringByEvaluatingJavaScriptFromString:@"document.body==null"]];
-    if (isPDF) {
-        [CDVUserAgentUtil setUserAgent:_prevUserAgent lockToken:_userAgentLockToken];
-    }
-
-    [self.navigationDelegate webViewDidFinishLoad:theWebView];
-    loadingCount--;
-    [self incrementProgress:theWebView];
-
-    NSString *readyState = [theWebView stringByEvaluatingJavaScriptFromString:@"document.readyState"];
-
-    BOOL tpInteractive = [readyState isEqualToString:@"interactive"];
-    if (tpInteractive)
-    {
-        interactive = YES;
-        NSString *waitForCompleteJS = [NSString stringWithFormat:@"window.addEventListener('load',function() { var iframe = document.createElement('iframe'); iframe.style.display = 'none'; iframe.src = '%@://%@%@'; document.body.appendChild(iframe);  }, false);", theWebView.request.mainDocumentURL.scheme, theWebView.request.mainDocumentURL.host, completeRPCURLPath];
-        [theWebView stringByEvaluatingJavaScriptFromString:waitForCompleteJS];
-    }
-
-    BOOL isNotRedirect = currentURL && [currentURL isEqual:theWebView.request.mainDocumentURL];
-    BOOL complete = [readyState isEqualToString:@"complete"];
-    if (complete && isNotRedirect)
-    {
-        [self completeProgress:theWebView];
-    }
-}
-
-- (void)webView:(UIWebView*)theWebView didFailLoadWithError:(NSError*)error
-{
-    [self updateButton:theWebView];
-
-    [self.spinner stopAnimating];
-
-    self.addressLabel.text = NSLocalizedString(@"Load Error", nil);
-
-    [self.navigationDelegate webView:theWebView didFailLoadWithError:error];
-    loadingCount--;
-    [self incrementProgress:theWebView];
-
-    NSString *readyState = [theWebView stringByEvaluatingJavaScriptFromString:@"document.readyState"];
-
-    BOOL tpInteractive = [readyState isEqualToString:@"interactive"];
-    if (tpInteractive)
-    {
-        interactive = YES;
-        NSString *waitForCompleteJS = [NSString stringWithFormat:@"window.addEventListener('load',function() { var iframe = document.createElement('iframe'); iframe.style.display = 'none'; iframe.src = '%@://%@%@'; document.body.appendChild(iframe);  }, false);", theWebView.request.mainDocumentURL.scheme, theWebView.request.mainDocumentURL.host, completeRPCURLPath];
-        [theWebView stringByEvaluatingJavaScriptFromString:waitForCompleteJS];
-    }
-
-    BOOL isNotRedirect = currentURL && [currentURL isEqual:theWebView.request.mainDocumentURL];
-    BOOL complete = [readyState isEqualToString:@"complete"];
-    if ((complete && isNotRedirect) || error)
-    {
-        [self completeProgress:theWebView];
-    }
-}
-
--(void)setprogress:(CGFloat)progress webView:(UIWebView *)webView
-{
-
-    if (progress == 0 && (currentLoadProgress == 1 || currentLoadProgress == 99))
-    {
-        //新的开始标记
-        currentLoadProgress = progress;
-       [self.progressView setProgress:progress animated:YES];
-
-    }
-    else
-    {
-        if (progress > currentLoadProgress)
-        {
-            currentLoadProgress = progress;
-           [self.progressView setProgress:progress animated:YES];
-        }
-    }
-}
-
-- (void) hideAndResetProgress
-{
-    [self.progressView setHidden:YES];
-    [self.progressView setProgress:0 animated:NO];
-}
-
-- (void)reset:(UIWebView *)webView
-{
-    maxLoadCount = loadingCount = 0;
-    interactive = NO;
-    [self setprogress:0.0 webView:webView];
-}
-
-- (void)startProgress:(UIWebView *)webView
-{
-    if (currentLoadProgress < MyInitialProgressValue)
-    {
-        [self.progressView setHidden:NO];
-        [self setprogress:MyInitialProgressValue webView:webView];
-    }
-}
-
-/**
- *
- *  @param webView webView
- */
-- (void)completeProgress:(UIWebView *)webView
-{
-    [self setprogress:1.0 webView:webView];
-    [NSTimer scheduledTimerWithTimeInterval:1 target:self selector:@selector(hideAndResetProgress) userInfo:nil repeats:NO];
-}
-
-- (void)incrementProgress:(UIWebView *)webView
-{
-    float progress = currentLoadProgress;
-    float maxProgress = interactive ? MyFinalProgressValue : MyInteractiveProgressValue;
-    float remainPercent = (float)loadingCount / (float)maxLoadCount;
-    float increment = (maxProgress - progress) * remainPercent;
-    progress += increment;
-    progress = fmin(progress, maxProgress);
-    [self setprogress:progress webView:webView];
-}
-
-/**
- *
- *  @return currentProgress
- */
--(CGFloat)loadProgress
-{
-    if (currentLoadProgress == 99)
-    {
-        return 0;
-    }
-    else
-    {
-        return currentLoadProgress;
-    }
-}
-
-- (void)updateButton:(UIWebView*)theWebView
+- (void)updateButton:(WKWebView*)theWebView
 {
     if (self.backButton) {
         self.backButton.enabled = _browserOptions.backButtonCanClose || theWebView.canGoBack;
+
+        BOOL showFirstTime = [self getBoolFromDict:_browserOptions.backButton withKey:kThemeableBrowserPropShowFirstTime];
+        if (showFirstTime == false) {
+            if(theWebView.canGoBack) {
+               self.backButton.hidden = NO;
+            }else {
+               self.backButton.hidden = YES;
+            }
+        }
     }
 
     if (self.forwardButton) {
         self.forwardButton.enabled = theWebView.canGoForward;
     }
+}
+
+static void extracted(CDVThemeableBrowserViewController *object, WKWebView *theWebView) {
+    [object updateButton:theWebView];
 }
 
 /**
@@ -1724,11 +1893,20 @@ const float MyFinalProgressValue = 0.9f;
  * will have to depend on the back and forward button to give us hints when to
  * change button states.
  */
-- (void)updateButtonDelayed:(UIWebView*)theWebView
+- (void)updateButtonDelayed:(WKWebView*)theWebView
 {
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 0.1 * NSEC_PER_SEC), dispatch_get_main_queue(), ^{
-        [self updateButton:theWebView];
+        extracted(self, theWebView);
     });
+}
+
+#pragma mark WKScriptMessageHandler delegate
+- (void)userContentController:(nonnull WKUserContentController *)userContentController didReceiveScriptMessage:(nonnull WKScriptMessage *)message {
+    if (![message.name isEqualToString:IAB_BRIDGE_NAME]) {
+        return;
+    }
+    //NSLog(@"Received script message %@", message.body);
+    [self.navigationDelegate userContentController:userContentController didReceiveScriptMessage:message];
 }
 
 #pragma mark CDVScreenOrientationDelegate
@@ -1797,6 +1975,7 @@ const float MyFinalProgressValue = 0.9f;
         self.clearsessioncache = NO;
 
         self.zoom = YES;
+        self.enableviewportscale = NO;
         self.mediaplaybackrequiresuseraction = NO;
         self.allowinlinemediaplayback = NO;
         self.keyboarddisplayrequiresuseraction = YES;
@@ -1809,11 +1988,13 @@ const float MyFinalProgressValue = 0.9f;
         self.title = nil;
         self.backButton = nil;
         self.forwardButton = nil;
+        self.reloadButton = nil;
         self.closeButton = nil;
         self.menu = nil;
         self.backButtonCanClose = NO;
         self.disableAnimation = NO;
         self.fullscreen = NO;
+        self.allowsBackForwardNavigationGestures = NO;
     }
 
     return self;
